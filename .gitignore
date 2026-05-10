@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+
+# Build output
+build/
+dist/
+coverage/
+
+# Capacitor generated web assets
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/app/src/main/res/xml/config.xml
+
+# Android / Gradle output
+android/.gradle/
+android/**/build/
+android/local.properties
+android/*.iml
+android/.idea/workspace.xml
+android/.idea/tasks.xml
+android/.idea/gradle.xml
+android/.idea/assetWizardSettings.xml
+android/.idea/caches/
+android/.idea/modules.xml
+android/.idea/navEditor.xml
+android/.externalNativeBuild/
+android/.cxx/
+android/capacitor-cordova-android-plugins/
+*.apk
+*.aab
+*.aar
+*.ap_
+*.dex
+*.class
+
+# Local signing files
+*.jks
+*.keystore
+key.properties
+
+# Logs and local env
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.env*
+!.env.example
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Tool caches
+.vite/
+*.tsbuildinfo

@@ -1,0 +1,6 @@
+{
+  "name": "Noteify - Repeating Notifications",
+  "description": "A powerful notification scheduler with repeating patterns, groups, and persistent reminders for Android using Capacitor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
