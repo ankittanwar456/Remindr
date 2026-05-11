@@ -2,13 +2,21 @@ import { LocalNotifications, Schedule } from '@capacitor/local-notifications';
 import { Capacitor } from '@capacitor/core';
 import { NotificationTask } from '../types';
 
-const getNotificationId = (taskId: string) => {
+export const TASK_ACTIONS_ID = 'TASK_ACTIONS';
+export const COMPLETE_ACTION_ID = 'complete';
+export const SNOOZE_ACTION_ID = 'snooze';
+
+export const getNotificationId = (taskId: string) => {
   const numericId = parseInt(taskId.replace(/\D/g, '').slice(0, 8), 10);
   if (numericId) return numericId;
 
   return [...taskId].reduce((hash, char) => {
     return (hash * 31 + char.charCodeAt(0)) % 2147483647;
   }, 7);
+};
+
+const getSnoozeNotificationId = (taskId: string) => {
+  return (getNotificationId(taskId) + 1000000000) % 2147483647;
 };
 
 const getTaskSchedule = (task: NotificationTask): Schedule => {
@@ -30,8 +38,38 @@ const getTaskSchedule = (task: NotificationTask): Schedule => {
 };
 
 export const NotificationService = {
+  async registerActions() {
+    if (Capacitor.getPlatform() === 'web') return;
+
+    await LocalNotifications.registerActionTypes({
+      types: [
+        {
+          id: TASK_ACTIONS_ID,
+          actions: [
+            { id: SNOOZE_ACTION_ID, title: 'Snooze' },
+            { id: COMPLETE_ACTION_ID, title: 'Complete' }
+          ]
+        }
+      ]
+    });
+  },
+
+  async onActionPerformed(handler: (actionId: string, taskId: string) => void) {
+    if (Capacitor.getPlatform() === 'web') return undefined;
+
+    const listener = await LocalNotifications.addListener('localNotificationActionPerformed', (event) => {
+      const taskId = event.notification.extra?.taskId;
+      if (typeof taskId === 'string') {
+        handler(event.actionId, taskId);
+      }
+    });
+
+    return listener;
+  },
+
   async requestPermissions() {
     if (Capacitor.getPlatform() === 'web') return true;
+    await this.registerActions();
     const permissions = await LocalNotifications.requestPermissions();
 
     if (Capacitor.getPlatform() === 'android') {
@@ -58,9 +96,9 @@ export const NotificationService = {
           id,
           schedule: { at: scheduleAt },
           ongoing, // Sticky on Android
-          actionTypeId: 'TASK_ACTIONS',
+          actionTypeId: TASK_ACTIONS_ID,
           extra: {
-            taskId: id
+            taskId: String(id)
           }
         },
       ],
@@ -74,11 +112,6 @@ export const NotificationService = {
 
   async scheduleTask(task: NotificationTask) {
     const id = getNotificationId(task.id);
-
-    if (!task.isEnabled) {
-      await this.cancel(id);
-      return;
-    }
 
     if (Capacitor.getPlatform() === 'web') {
       console.log(`[Web Mock] Scheduling repeating task: ${task.title}`);
@@ -94,6 +127,7 @@ export const NotificationService = {
           id,
           schedule: getTaskSchedule(task),
           ongoing: true,
+          actionTypeId: TASK_ACTIONS_ID,
           extra: {
             taskId: task.id
           }
@@ -103,6 +137,34 @@ export const NotificationService = {
   },
 
   async cancelTask(taskId: string) {
-    await this.cancel(getNotificationId(taskId));
+    await Promise.all([
+      this.cancel(getNotificationId(taskId)),
+      this.cancel(getSnoozeNotificationId(taskId))
+    ]);
+  },
+
+  async snoozeTask(task: NotificationTask, minutes = 15) {
+    if (Capacitor.getPlatform() === 'web') {
+      console.log(`[Web Mock] Snoozing task: ${task.title}`);
+      return;
+    }
+
+    const scheduleAt = new Date(Date.now() + minutes * 60 * 1000);
+    await this.cancel(getNotificationId(task.id));
+    await LocalNotifications.schedule({
+      notifications: [
+        {
+          title: task.title,
+          body: task.body,
+          id: getSnoozeNotificationId(task.id),
+          schedule: { at: scheduleAt },
+          ongoing: true,
+          actionTypeId: TASK_ACTIONS_ID,
+          extra: {
+            taskId: task.id
+          }
+        }
+      ]
+    });
   }
 };

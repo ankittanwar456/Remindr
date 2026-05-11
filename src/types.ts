@@ -18,6 +18,9 @@ export interface NotificationTask {
   groupId: string;
   count: number | null; // null for infinite
   completedCount: number;
+  completedDates?: string[]; // yyyy-MM-dd occurrence dates marked complete
+  lastCompletedAt?: string; // ISO DateTime
+  lastSnoozedAt?: string; // ISO DateTime
   startDate: string; // ISO Date
   lastNotifiedDate?: string; // ISO Date
   isEnabled: boolean;

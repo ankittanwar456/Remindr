@@ -1,21 +1,35 @@
 import React, { useState, useEffect } from 'react';
-import { format, addDays, startOfToday, isSameDay, subDays, parseISO, setHours, setMinutes } from 'date-fns';
-import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Plus, Settings, Filter, X, Check, Bell, BellOff, Trash2, Menu } from 'lucide-react';
+import { format, addDays, startOfToday, isSameDay, isAfter, subDays, parseISO } from 'date-fns';
+import { ChevronLeft, ChevronRight, Calendar as CalendarIcon, Settings, Filter, X, Check, Bell, Trash2, Menu } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { NotificationTask, Group, RepeatType, ViewType } from './types';
 import { Storage } from './lib/storage';
 import { cn } from './lib/utils';
-import { NotificationService } from './lib/notifications';
+import { COMPLETE_ACTION_ID, NotificationService, SNOOZE_ACTION_ID } from './lib/notifications';
+
+const getDateKey = (date: Date) => format(date, 'yyyy-MM-dd');
+
+const getCompletedDates = (task: NotificationTask) => {
+  const completedDates = task.completedDates || [];
+  if (!task.lastCompletedAt) return completedDates;
+
+  const legacyDate = getDateKey(parseISO(task.lastCompletedAt));
+  return completedDates.includes(legacyDate) ? completedDates : [...completedDates, legacyDate];
+};
+
+const isTaskCompletedOnDate = (task: NotificationTask, date: Date) => {
+  return getCompletedDates(task).includes(getDateKey(date));
+};
 
 // Helper to check if a task should appear on a specific date
 const isTaskDueOnDate = (task: NotificationTask, date: Date): boolean => {
-  if (!task.isEnabled) return false;
-  
   const startDate = parseISO(task.startDate);
   if (date < startDate && !isSameDay(date, startDate)) return false;
 
-  // If limited count reached
-  if (task.count !== null && task.completedCount >= task.count) return false;
+  // Keep a just-completed limited task visible for the day so the action has visible feedback.
+  if (task.count !== null && task.completedCount >= task.count) {
+    return isTaskCompletedOnDate(task, date);
+  }
 
   switch (task.repeatType) {
     case 'daily':
@@ -42,10 +56,28 @@ export default function App() {
   const [isAddingTask, setIsAddingTask] = useState(false);
   const [editingTask, setEditingTask] = useState<NotificationTask | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   useEffect(() => {
     NotificationService.requestPermissions();
-    
+    let removeNotificationActionListener: (() => void) | undefined;
+
+    NotificationService.onActionPerformed((actionId, taskId) => {
+      if (actionId === COMPLETE_ACTION_ID) {
+        completeTask(taskId, 'notification');
+      }
+
+      if (actionId === SNOOZE_ACTION_ID) {
+        snoozeTask(taskId);
+      }
+    }).then(listener => {
+      removeNotificationActionListener = () => listener?.remove();
+    });
+
+    return () => removeNotificationActionListener?.();
+  }, []);
+
+  useEffect(() => {
     // Safety check: ensure all tasks have a valid group
     const groupIds = groups.map(g => g.id);
     const orphanTasks = tasks.filter(t => !groupIds.includes(t.groupId));
@@ -65,6 +97,11 @@ export default function App() {
     Storage.saveGroups(newGroups);
   };
 
+  const showStatus = (message: string) => {
+    setStatusMessage(message);
+    window.setTimeout(() => setStatusMessage(null), 3000);
+  };
+
   const addGroup = (name: string, color: string) => {
     const newGroup: Group = {
       id: Math.random().toString(36).substr(2, 9),
@@ -81,36 +118,122 @@ export default function App() {
     saveGroups(groups.filter(g => g.id !== id));
   };
 
-  const completeTask = (taskId: string) => {
-    const newTasks = tasks.map(t => {
+  const completeTask = (taskId: string, source: 'app' | 'notification' = 'app') => {
+    const sourceTasks = Storage.getTasks().length ? Storage.getTasks() : tasks;
+    const completionDate = source === 'notification' ? startOfToday() : selectedDate;
+    const completionDateKey = getDateKey(completionDate);
+    let completedTask: NotificationTask | undefined;
+
+    const newTasks = sourceTasks.map(t => {
       if (t.id === taskId) {
-        const id = parseInt(t.id.replace(/\D/g, '').slice(0, 8)) || Math.floor(Math.random() * 100000);
-        NotificationService.cancel(id);
-        return { ...t, completedCount: t.completedCount + 1 };
+        const completedDates = getCompletedDates(t);
+        if (completedDates.includes(completionDateKey)) {
+          completedTask = t;
+          return t;
+        }
+
+        completedTask = {
+          ...t,
+          completedCount: t.completedCount + 1,
+          completedDates: [...completedDates, completionDateKey],
+          lastCompletedAt: new Date().toISOString()
+        };
+        return completedTask;
       }
       return t;
     });
+
+    if (!completedTask) return;
+
     saveTasks(newTasks);
+    NotificationService.cancelTask(taskId);
+
+    if (completedTask.count === null || completedTask.completedCount < completedTask.count) {
+      NotificationService.scheduleTask(completedTask);
+    }
+
+    showStatus(source === 'notification' ? `${completedTask.title} marked complete from notification` : `${completedTask.title} marked complete`);
+  };
+
+  const markTaskIncomplete = (taskId: string, date: Date) => {
+    const sourceTasks = Storage.getTasks().length ? Storage.getTasks() : tasks;
+    const completionDateKey = getDateKey(date);
+    let restoredTask: NotificationTask | undefined;
+
+    const newTasks = sourceTasks.map(t => {
+      if (t.id === taskId) {
+        const completedDates = getCompletedDates(t);
+        if (!completedDates.includes(completionDateKey)) {
+          restoredTask = t;
+          return t;
+        }
+
+        const nextCompletedDates = completedDates.filter(dateKey => dateKey !== completionDateKey);
+        restoredTask = {
+          ...t,
+          completedCount: Math.max(0, t.completedCount - 1),
+          completedDates: nextCompletedDates,
+          lastCompletedAt: nextCompletedDates.length > 0 ? t.lastCompletedAt : undefined
+        };
+        return restoredTask;
+      }
+      return t;
+    });
+
+    if (!restoredTask) return;
+
+    saveTasks(newTasks);
+    NotificationService.scheduleTask(restoredTask);
+    showStatus(`${restoredTask.title} marked incomplete`);
+  };
+
+  const toggleTaskCompletion = (taskId: string, isCompleted: boolean, date: Date) => {
+    if (isAfter(date, startOfToday())) {
+      showStatus('Future reminders are read-only');
+      return;
+    }
+
+    if (isCompleted) {
+      markTaskIncomplete(taskId, date);
+      return;
+    }
+
+    completeTask(taskId);
+  };
+
+  const snoozeTask = (taskId: string) => {
+    const sourceTasks = Storage.getTasks().length ? Storage.getTasks() : tasks;
+    let snoozedTask: NotificationTask | undefined;
+
+    const newTasks = sourceTasks.map(t => {
+      if (t.id === taskId) {
+        snoozedTask = { ...t, lastSnoozedAt: new Date().toISOString() };
+        return snoozedTask;
+      }
+      return t;
+    });
+
+    if (!snoozedTask) return;
+
+    saveTasks(newTasks);
+    NotificationService.snoozeTask(snoozedTask);
+    showStatus(`${snoozedTask.title} snoozed for 15 minutes`);
   };
 
   const tasksForDay = tasks.filter(t => isTaskDueOnDate(t, selectedDate));
-  const activeStickies = tasks.filter(t => t.isEnabled && isTaskDueOnDate(t, startOfToday())).length;
-
-  const toggleTask = (taskId: string) => {
-    const newTasks = tasks.map(t => {
-      if (t.id === taskId) {
-        const updatedTask = { ...t, isEnabled: !t.isEnabled };
-        NotificationService.scheduleTask(updatedTask);
-        return updatedTask;
-      }
-      return t;
-    });
-    saveTasks(newTasks);
-  };
-
   const deleteTask = (taskId: string) => {
     NotificationService.cancelTask(taskId);
     saveTasks(tasks.filter(t => t.id !== taskId));
+  };
+
+  const moveTaskToGroup = (taskId: string, groupId: string) => {
+    const taskToMove = tasks.find(t => t.id === taskId);
+    if (!taskToMove || taskToMove.groupId === groupId) return;
+
+    const updatedTask = { ...taskToMove, groupId };
+    saveTasks(tasks.map(t => t.id === taskId ? updatedTask : t));
+    NotificationService.scheduleTask(updatedTask);
+    showStatus(`${updatedTask.title} moved`);
   };
 
   return (
@@ -255,7 +378,11 @@ export default function App() {
                     ) : (
                       <AnimatePresence mode="popLayout">
                         {tasksForDay.map((task) => {
-                          const group = groups.find(g => g.id === task.groupId);
+                          const isFutureDate = isAfter(selectedDate, startOfToday());
+                          const completedOnSelectedDate = isTaskCompletedOnDate(task, selectedDate);
+                          const completedToday = isTaskCompletedOnDate(task, startOfToday());
+                          const snoozedToday = task.lastSnoozedAt && isSameDay(parseISO(task.lastSnoozedAt), startOfToday());
+                          const isCompleted = Boolean(completedOnSelectedDate);
                           return (
                             <motion.div
                               key={task.id}
@@ -264,51 +391,63 @@ export default function App() {
                               animate={{ opacity: 1, x: 0 }}
                               exit={{ opacity: 0, scale: 0.95 }}
                               className={cn(
-                                "bg-white border border-gray-200 p-6 rounded-2xl shadow-sm transition-all relative overflow-hidden group",
-                                task.isEnabled ? "border-l-4 border-l-brand" : "opacity-60"
+                                "bg-white border border-gray-200 p-5 rounded-2xl shadow-sm transition-all relative overflow-hidden group",
+                                "border-l-4 border-l-brand",
+                                isCompleted && "border-l-emerald-500 bg-emerald-50/30"
                               )}
                             >
-                              <div className="flex flex-col sm:flex-row justify-between items-start gap-4">
+                              <div className="flex flex-col sm:flex-row justify-between items-start gap-3">
                                 <div className="flex-1">
-                                  <div className="flex flex-wrap items-center gap-2 mb-2">
-                                    {task.isEnabled && (
-                                      <span className="text-[9px] font-bold bg-indigo-50 text-brand px-2 py-0.5 rounded tracking-wide uppercase">Sticky</span>
-                                    )}
-                                    <span className="text-[9px] font-bold text-gray-400 uppercase tracking-widest">
-                                      {task.repeatType === 'customDays' ? `Every ${task.repeatValue} Days` : task.repeatType} • {task.count ? `${task.completedCount}/${task.count}` : 'Infinite'}
-                                    </span>
+                                  <div className="flex items-start gap-3 mb-3 pr-10">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <p className="text-[10px] font-extrabold text-gray-700 flex items-center gap-1.5 uppercase tracking-widest bg-gray-50 px-3 py-1 rounded-lg">
+                                        <Bell className="w-3.5 h-3.5" />
+                                        {task.time}
+                                      </p>
+                                      {snoozedToday && !completedToday && (
+                                        <span className="text-[9px] font-bold bg-amber-50 text-amber-600 px-2 py-0.5 rounded tracking-wide uppercase">Snoozed</span>
+                                      )}
+                                    </div>
                                   </div>
-                                  <h4 className="text-lg font-extrabold text-gray-900 leading-tight">{task.title}</h4>
-                                  <p className="text-sm text-gray-500 mt-2 line-clamp-2">{task.body}</p>
-                                  <div className="flex items-center gap-4 mt-4">
-                                    <p className="text-[10px] font-extrabold text-gray-700 flex items-center gap-1.5 uppercase tracking-widest bg-gray-50 px-3 py-1 rounded-lg">
-                                      <Bell className="w-3.5 h-3.5" />
-                                      {task.time}
-                                    </p>
-                                    <span className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest" style={{ color: group?.color || '#000' }}>
-                                      <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: group?.color || '#000' }} />
-                                      {group?.name}
-                                    </span>
-                                  </div>
+                                  <h4 className={cn(
+                                    "text-lg font-extrabold leading-tight transition-all",
+                                    isCompleted ? "text-gray-500" : "text-gray-900"
+                                  )}>{task.title}</h4>
+                                  <p className={cn(
+                                    "text-sm mt-2 line-clamp-2 transition-all",
+                                    isCompleted ? "text-gray-400" : "text-gray-500"
+                                  )}>{task.body}</p>
                                 </div>
+                                <button 
+                                  onClick={() => setEditingTask(task)}
+                                  aria-label="Edit notification details"
+                                  title="Edit notification details"
+                                  className="absolute right-4 top-4 p-2 text-gray-400 hover:bg-gray-50 hover:text-gray-900 rounded-xl transition-all"
+                                >
+                                  <Settings className="w-4 h-4" />
+                                </button>
                                 <div className="flex items-center gap-2 w-full sm:w-auto">
-                                  <button 
-                                    onClick={() => setEditingTask(task)}
-                                    className="p-2.5 text-gray-400 hover:bg-gray-50 hover:text-gray-900 rounded-xl transition-all"
+                                  <button
+                                    onClick={() => toggleTaskCompletion(task.id, isCompleted, selectedDate)}
+                                    disabled={isFutureDate}
+                                    aria-pressed={isCompleted}
+                                    title={isFutureDate ? 'Future reminders are read-only' : isCompleted ? 'Mark incomplete' : 'Mark done'}
+                                    className={cn(
+                                      "flex h-7 items-center justify-center gap-1.5 rounded-full border px-2.5 text-[9px] font-bold uppercase tracking-widest transition-all",
+                                      isFutureDate
+                                        ? "border-gray-100 bg-gray-50 text-gray-300 cursor-not-allowed"
+                                        : isCompleted
+                                          ? "border-emerald-200 bg-emerald-50 text-emerald-700 hover:border-emerald-300 hover:bg-white active:scale-95"
+                                          : "border-gray-200 bg-white text-gray-500 hover:border-emerald-300 hover:bg-emerald-50 hover:text-emerald-700 active:scale-95"
+                                    )}
                                   >
-                                    <Settings className="w-4 h-4" />
-                                  </button>
-                                  <button 
-                                    onClick={() => toggleTask(task.id)}
-                                    className="p-2.5 text-gray-400 hover:bg-gray-50 rounded-xl transition-all"
-                                  >
-                                    {task.isEnabled ? <Bell className="w-4 h-4" /> : <BellOff className="w-4 h-4" />}
-                                  </button>
-                                  <button 
-                                    onClick={() => completeTask(task.id)}
-                                    className="flex-1 sm:flex-none px-5 py-2.5 bg-brand text-white text-[10px] font-bold rounded-xl uppercase tracking-widest shadow-lg shadow-indigo-100 hover:shadow-indigo-200 transition-all active:scale-95"
-                                  >
-                                    Complete
+                                    <span className={cn(
+                                      "flex h-4 w-4 items-center justify-center rounded-full border-2 transition-all",
+                                      isFutureDate ? "border-gray-200" : isCompleted ? "border-emerald-500 bg-emerald-500 text-white" : "border-gray-300"
+                                    )}>
+                                      {isCompleted && <Check className="h-3 w-3" />}
+                                    </span>
+                                    {isCompleted ? 'Done' : 'Done'}
                                   </button>
                                 </div>
                               </div>
@@ -335,6 +474,9 @@ export default function App() {
                 tasks={tasks} 
                 onAddGroup={addGroup} 
                 onDeleteGroup={deleteGroup} 
+                onEditTask={setEditingTask}
+                onDeleteTask={deleteTask}
+                onMoveTask={moveTaskToGroup}
               />
             )}
 
@@ -383,6 +525,20 @@ export default function App() {
         </div>
       </div>
 
+      {/* Status toast */}
+      <AnimatePresence>
+        {statusMessage && (
+          <motion.div
+            initial={{ opacity: 0, y: 16 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 16 }}
+            className="fixed left-1/2 bottom-6 z-[60] -translate-x-1/2 rounded-2xl bg-gray-950 px-5 py-3 text-xs font-bold uppercase tracking-widest text-white shadow-2xl"
+          >
+            {statusMessage}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Modals */}
       <AnimatePresence>
         {(isAddingTask || editingTask) && (
@@ -410,14 +566,21 @@ export default function App() {
   );
 }
 
-function GroupsView({ groups, tasks, onAddGroup, onDeleteGroup }: { 
+function GroupsView({ groups, tasks, onAddGroup, onDeleteGroup, onEditTask, onDeleteTask, onMoveTask }: { 
   groups: Group[], 
   tasks: NotificationTask[], 
   onAddGroup: (name: string, color: string) => void,
-  onDeleteGroup: (id: string) => void
+  onDeleteGroup: (id: string) => void,
+  onEditTask: (task: NotificationTask) => void,
+  onDeleteTask: (id: string) => void,
+  onMoveTask: (taskId: string, groupId: string) => void
 }) {
   const [newGroupColor, setNewGroupColor] = useState('#6366f1');
   const [newGroupName, setNewGroupName] = useState('');
+  const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+
+  const selectedGroup = selectedGroupId ? groups.find(group => group.id === selectedGroupId) : null;
+  const selectedGroupTasks = selectedGroup ? tasks.filter(task => task.groupId === selectedGroup.id) : [];
 
   return (
     <motion.div 
@@ -433,12 +596,16 @@ function GroupsView({ groups, tasks, onAddGroup, onDeleteGroup }: {
           <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-4 bg-surface p-4 md:p-6 rounded-2xl border border-gray-100 items-end">
             <div className="space-y-3 w-full min-w-0">
                <div className="flex items-center gap-3 w-full">
-                  <div className="relative w-12 h-12 shrink-0 overflow-hidden rounded-xl border-2 border-white shadow-xl ring-1 ring-gray-100">
+                  <div
+                    className="relative w-12 h-12 shrink-0 overflow-hidden rounded-xl border-2 border-white shadow-xl ring-1 ring-gray-100"
+                    style={{ backgroundColor: newGroupColor }}
+                  >
                     <input 
                       type="color"
                       value={newGroupColor}
                       onChange={e => setNewGroupColor(e.target.value)}
-                      className="absolute inset-0 scale-150 cursor-pointer"
+                      className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                      aria-label="Choose group color"
                     />
                   </div>
                   <input 
@@ -463,36 +630,130 @@ function GroupsView({ groups, tasks, onAddGroup, onDeleteGroup }: {
           </div>
         </div>
 
-        <div className="space-y-4">
-          <h3 className="label-caps">Your Management Groups</h3>
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {groups.map(group => (
-              <div key={group.id} className="group bg-white border border-gray-100 p-5 rounded-2xl shadow-sm hover:shadow-md hover:border-gray-200 transition-all">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div className="w-10 h-10 rounded-xl shadow-inner flex items-center justify-center" style={{ backgroundColor: group.color + '20' }}>
-                      <div className="w-3 h-3 rounded-full" style={{ backgroundColor: group.color }} />
-                    </div>
-                    <div>
-                      <h4 className="font-bold text-gray-900">{group.name}</h4>
-                      <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">
-                        {tasks.filter(t => t.groupId === group.id).length} reminders
-                      </p>
-                    </div>
-                  </div>
-                  {group.id !== 'default' && (
-                    <button 
-                      onClick={() => onDeleteGroup(group.id)}
-                      className="p-2 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all opacity-0 group-hover:opacity-100"
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
-                  )}
+        {selectedGroup ? (
+          <div className="space-y-5">
+            <button
+              onClick={() => setSelectedGroupId(null)}
+              className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-gray-400 hover:text-brand transition-colors"
+            >
+              <ChevronLeft className="w-4 h-4" />
+              Back to groups
+            </button>
+
+            <div className="flex items-center justify-between gap-4">
+              <div className="flex items-center gap-4 min-w-0">
+                <div className="w-12 h-12 rounded-xl shadow-inner flex items-center justify-center shrink-0" style={{ backgroundColor: selectedGroup.color + '20' }}>
+                  <div className="w-3.5 h-3.5 rounded-full" style={{ backgroundColor: selectedGroup.color }} />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="text-xl font-extrabold text-gray-900 truncate">{selectedGroup.name}</h3>
+                  <p className="label-caps">{selectedGroupTasks.length} reminders in this group</p>
                 </div>
               </div>
-            ))}
+              {selectedGroup.id !== 'default' && (
+                <button
+                  onClick={() => {
+                    onDeleteGroup(selectedGroup.id);
+                    setSelectedGroupId(null);
+                  }}
+                  className="p-2.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                  aria-label={`Delete ${selectedGroup.name} group`}
+                  title={`Delete ${selectedGroup.name} group`}
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+              )}
+            </div>
+
+            {selectedGroupTasks.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-16 text-gray-400 bg-surface border border-gray-100 rounded-3xl">
+                <Bell className="w-10 h-10 mb-4 opacity-10" />
+                <p className="text-xs font-bold uppercase tracking-[0.2em] opacity-50">No notifications in this group</p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {selectedGroupTasks.map(task => (
+                  <div key={task.id} className="bg-white border border-gray-100 p-4 rounded-2xl shadow-sm space-y-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                          <span className="text-[9px] font-bold bg-indigo-50 text-brand px-2 py-0.5 rounded tracking-wide uppercase">
+                            {task.repeatType === 'customDays' ? `Every ${task.repeatValue || 1} days` : task.repeatType}
+                          </span>
+                        </div>
+                        <h4 className="font-extrabold text-gray-900 truncate">{task.title}</h4>
+                        {task.body && <p className="text-sm text-gray-500 mt-1 line-clamp-2">{task.body}</p>}
+                        <p className="text-[10px] font-extrabold text-gray-700 flex items-center gap-1.5 uppercase tracking-widest mt-3">
+                          <Bell className="w-3.5 h-3.5" />
+                          {task.time}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          onClick={() => onEditTask(task)}
+                          className="p-2.5 text-gray-400 hover:bg-gray-50 hover:text-gray-900 rounded-xl transition-all"
+                          aria-label={`Edit ${task.title}`}
+                          title={`Edit ${task.title}`}
+                        >
+                          <Settings className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={() => onDeleteTask(task.id)}
+                          className="p-2.5 text-gray-300 hover:text-red-500 hover:bg-red-50 rounded-xl transition-all"
+                          aria-label={`Delete ${task.title}`}
+                          title={`Delete ${task.title}`}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-[auto_1fr] gap-2 sm:items-center">
+                      <label className="label-caps px-1">Move to group</label>
+                      <select
+                        value={task.groupId}
+                        onChange={e => onMoveTask(task.id, e.target.value)}
+                        className="w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 text-xs font-bold text-gray-900 outline-none appearance-none cursor-pointer focus:ring-2 focus:ring-brand transition-all"
+                      >
+                        {groups.map(group => (
+                          <option key={group.id} value={group.id}>{group.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        </div>
+        ) : (
+          <div className="space-y-4">
+            <h3 className="label-caps">Your Management Groups</h3>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {groups.map(group => (
+                <button
+                  key={group.id}
+                  onClick={() => setSelectedGroupId(group.id)}
+                  className="group bg-white border border-gray-100 p-5 rounded-2xl shadow-sm hover:shadow-md hover:border-gray-200 transition-all text-left"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-4 min-w-0">
+                      <div className="w-10 h-10 rounded-xl shadow-inner flex items-center justify-center shrink-0" style={{ backgroundColor: group.color + '20' }}>
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: group.color }} />
+                      </div>
+                      <div className="min-w-0">
+                        <h4 className="font-bold text-gray-900 truncate">{group.name}</h4>
+                        <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest">
+                          {tasks.filter(t => t.groupId === group.id).length} reminders
+                        </p>
+                      </div>
+                    </div>
+                    <ChevronRight className="w-4 h-4 text-gray-300 group-hover:text-brand transition-colors shrink-0" />
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </motion.div>
   );
@@ -561,8 +822,11 @@ function NotificationForm({ onClose, groups, onSave, taskToEdit }: {
       groupId,
       count: count === 'infinite' ? null : Number(count),
       completedCount: taskToEdit?.completedCount || 0,
+      completedDates: taskToEdit ? getCompletedDates(taskToEdit) : [],
+      lastCompletedAt: taskToEdit?.lastCompletedAt,
+      lastSnoozedAt: taskToEdit?.lastSnoozedAt,
       startDate: taskToEdit?.startDate || format(startOfToday(), 'yyyy-MM-dd'),
-      isEnabled: taskToEdit ? taskToEdit.isEnabled : true
+      isEnabled: true
     };
     onSave(task);
   };

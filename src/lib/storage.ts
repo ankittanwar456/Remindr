@@ -6,7 +6,8 @@ const GROUPS_KEY = 'noteify_groups';
 export const Storage = {
   getTasks(): NotificationTask[] {
     const data = localStorage.getItem(TASKS_KEY);
-    return data ? JSON.parse(data) : [];
+    const tasks: NotificationTask[] = data ? JSON.parse(data) : [];
+    return tasks.map(task => ({ ...task, isEnabled: true }));
   },
   saveTasks(tasks: NotificationTask[]) {
     localStorage.setItem(TASKS_KEY, JSON.stringify(tasks));
